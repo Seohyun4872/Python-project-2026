@@ -1,0 +1,242 @@
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+import pandas as pd
+import time
+from datetime import datetime
+import undetected_chromedriver as uc
+import random
+import re
+
+# =========================
+# 사용자 설정
+# =========================
+TARGET_BRANDS = ["로긴앤로지", "로긴 앤 로지", "Rogin", "ROGIN"]
+RANKING_URL = "https://www.musinsa.com/main/musinsa/ranking"
+SAVE_PATH = "rogin_ranking_tracking.xlsx"
+
+# 랭킹 페이지 새로 체크하는 간격(초)
+CHECK_INTERVAL = 30
+
+# 스크롤 횟수 / 100위까지 읽기용
+TARGET_LENGTH = 100
+
+# 크롬 버전 맞춰서 수정 필요할 수 있음
+CHROME_VERSION = 144
+
+# =========================
+# 크롬 옵션
+# =========================
+options = uc.ChromeOptions()
+options.add_argument("--disable-gpu")
+options.add_argument("--no-sandbox")
+options.add_argument("--start-maximized")
+
+driver = uc.Chrome(options=options, version_main=CHROME_VERSION)
+wait = WebDriverWait(driver, 20)
+
+# 메모리 누적용
+collected_data = []
+
+
+# =========================
+# 랭킹 페이지 열기
+# =========================
+def open_ranking_page():
+    driver.get(RANKING_URL)
+    time.sleep(random.uniform(2, 4))
+
+    try:
+        wait.until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, "button[data-extra-info='전체']"))
+        ).click()
+        time.sleep(2)
+    except Exception as e:
+        print(f"[open_ranking_page] '전체' 버튼 클릭 실패: {e}")
+
+
+# =========================
+# 업데이트 시간 확인
+# 예: '7분 전' -> 7
+# =========================
+def update_time():
+    driver.refresh()
+    time.sleep(2)
+
+    try:
+        text = wait.until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, "section > div > span[data-mds='Typography']")
+            )
+        ).text.strip()
+
+        match = re.search(r"(\d+)분 전", text)
+        if match:
+            return int(match.group(1))
+
+        if "방금" in text:
+            return 0
+
+        return None
+
+    except Exception as e:
+        print(f"[update_time] 업데이트 시간 확인 실패: {e}")
+        return None
+
+
+# =========================
+# 페이지 스크롤
+# =========================
+def scroll_down(times=1):
+    body = driver.find_element(By.TAG_NAME, "body")
+    for _ in range(times):
+        body.send_keys(Keys.SPACE)
+        time.sleep(1.5)
+
+
+# =========================
+# top100 랭킹 수집
+# return: DataFrame(RANK, BRAND, PRODUCT, URL)
+# =========================
+def prod_data(length=100):
+    urls = []
+    products = []
+    brands = []
+
+    while len(urls) < length:
+        lst_url = driver.find_elements(
+            By.CSS_SELECTOR,
+            "div[data-viewport-type='window'] > div > div > div > div > div > div > a:nth-child(2)"
+        )
+        lst_brand = driver.find_elements(
+            By.CSS_SELECTOR,
+            "div[data-viewport-type='window'] > div > div > div > div > div > div > a:nth-child(1) > p"
+        )
+        lst_prod = driver.find_elements(
+            By.CSS_SELECTOR,
+            "div[data-viewport-type='window'] > div > div > div > div > div > div > a:nth-child(2) > p"
+        )
+
+        min_len = min(len(lst_url), len(lst_brand), len(lst_prod))
+
+        for idx in range(min_len):
+            try:
+                tmp_url = lst_url[idx].get_attribute("href")
+                tmp_brand = lst_brand[idx].text.strip()
+                tmp_prod = lst_prod[idx].text.strip()
+
+                if tmp_url and tmp_url not in urls:
+                    urls.append(tmp_url)
+                    brands.append(tmp_brand)
+                    products.append(tmp_prod)
+
+            except Exception:
+                continue
+
+        if len(urls) >= length:
+            break
+
+        scroll_down(times=1)
+
+    urls = urls[:length]
+    products = products[:length]
+    brands = brands[:length]
+
+    rank_df = pd.DataFrame({
+        "RANK": range(1, len(urls) + 1),
+        "BRAND": brands,
+        "PRODUCT": products,
+        "URL": urls
+    })
+
+    return rank_df
+
+
+# =========================
+# 브랜드명 매칭 함수
+# =========================
+def is_target_brand(brand_name):
+    brand_name = str(brand_name).strip().lower()
+    return any(target.lower() in brand_name for target in TARGET_BRANDS)
+
+
+# =========================
+# 로긴앤로지 상품만 추출
+# 없으면 NOT_IN_TOP100 기록
+# =========================
+def collect_target_brand():
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    top100_df = prod_data(TARGET_LENGTH)
+
+    target_df = top100_df[top100_df["BRAND"].apply(is_target_brand)].copy()
+
+    if target_df.empty:
+        result_df = pd.DataFrame([{
+            "TIME": now,
+            "RANK": None,
+            "BRAND": "로긴앤로지",
+            "PRODUCT": None,
+            "URL": None,
+            "STATUS": "NOT_IN_TOP100"
+        }])
+    else:
+        result_df = target_df.copy()
+        result_df["TIME"] = now
+        result_df["STATUS"] = "IN_TOP100"
+        result_df = result_df[["TIME", "RANK", "BRAND", "PRODUCT", "URL", "STATUS"]]
+
+    return result_df
+
+
+# =========================
+# 지금까지 데이터 저장
+# =========================
+def save_data():
+    if collected_data:
+        final_df = pd.concat(collected_data, ignore_index=True)
+        final_df.to_excel(SAVE_PATH, index=False)
+        print(f"[save_data] 저장 완료: {SAVE_PATH}")
+
+
+# =========================
+# 메인 실행
+# =========================
+try:
+    open_ranking_page()
+
+    while True:
+        mn = update_time()
+        print(f"[loop] 현재 업데이트 표시: {mn}")
+
+        if mn == 7:
+            print("[loop] 업데이트 시점 감지 → 로긴앤로지 랭킹 수집 시작")
+
+            # 새로고침 후 전체 버튼 다시 눌러서 랭킹 화면 안정화
+            open_ranking_page()
+
+            result_df = collect_target_brand()
+            print(result_df)
+
+            collected_data.append(result_df)
+            save_data()
+
+            # 중복 수집 방지용 잠깐 대기
+            print("[loop] 중복 수집 방지를 위해 70초 대기")
+            time.sleep(70)
+
+            # 다시 랭킹 페이지 복귀
+            open_ranking_page()
+
+        else:
+            print(f"[loop] 아직 수집 시점 아님 → {CHECK_INTERVAL}초 대기")
+            time.sleep(CHECK_INTERVAL)
+
+except KeyboardInterrupt:
+    print("[main] 사용자가 수동 중지했습니다.")
+
+finally:
+    save_data()
+    driver.quit()
+    print("[main] 드라이버 종료 완료")
